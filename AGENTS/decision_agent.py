@@ -79,6 +79,9 @@ class FinalDecision:
     sanitization_action: Optional[str]
     policy_ref: Optional[str]
 
+    # Attack classification
+    attack_family_predicted: str     # from PromptAgent or metadata
+
     # Latency breakdown (ms)
     vision_ms: float
     prompt_ms: float
@@ -164,8 +167,11 @@ class DecisionAgent:
 
     def _get_prompt(self) -> PromptAgent:
         if self._prompt is None:
+            p_dir = self._models_dir
+            if p_dir and Path(p_dir).name != "roberta_classifier":
+                p_dir = str(Path(p_dir) / "roberta_classifier")
             self._prompt = PromptAgent(
-                model_dir=self._models_dir,
+                model_dir=p_dir,
                 threshold=self._prompt_threshold,
             )
         return self._prompt
@@ -259,8 +265,7 @@ class DecisionAgent:
         risk_level = "MEDIUM"
 
         try:
-            from risk_agent import RiskAgent as RA
-            features_dict = RA.build_feature_dict(
+            features_dict = RiskAgent.build_feature_dict(
                 malicious_probability=prompt_score,
                 vision_features=vision_features_dict,
                 severity=severity,
@@ -296,8 +301,7 @@ class DecisionAgent:
         except Exception as exc:
             # Fail-safe: unknown governance state → block
             print(f"[DecisionAgent] GovernanceAgent failed: {exc}")
-            from governance_agent import GovernanceDecision as GD
-            gov = GD(
+            gov = GovernanceDecision(
                 decision="BLOCK",
                 rule_id="G_FAILSAFE",
                 rule_name="Governance Failure Failsafe",
@@ -324,6 +328,7 @@ class DecisionAgent:
             reason=gov.reason,
             sanitization_action=gov.sanitization_action,
             policy_ref=gov.policy_ref,
+            attack_family_predicted="unknown",
             vision_ms=vision_ms,
             prompt_ms=prompt_ms,
             risk_ms=risk_ms,
@@ -345,3 +350,85 @@ class DecisionAgent:
                 f.write(json.dumps(result.to_dict()) + "\n")
         except Exception as exc:
             print(f"[DecisionAgent] Audit log write failed: {exc}")
+
+    # ── Batch processing (for evaluation notebooks) ───────────────────────────
+
+    def process_batch_from_features(
+        self,
+        features_df,
+        governance_agent=None,
+    ):
+        """
+        Run governance pipeline on pre-computed feature matrix rows.
+
+        This is much faster than process() because it skips OCR/VisionAgent/
+        RoBERTa inference and uses cached predictions and risk scores.
+
+        Args:
+            features_df: DataFrame with columns: sample_id, malicious_probability,
+                         vision_score, risk_score (or will be computed), plus
+                         vision feature columns.
+            governance_agent: Optional GovernanceAgent instance (reused).
+
+        Returns:
+            List[FinalDecision]
+        """
+        if governance_agent is None:
+            governance_agent = self._get_governance()
+
+        import pandas as pd
+
+        results = []
+        for _, row in features_df.iterrows():
+            t0 = time.perf_counter()
+            audit_id = str(uuid.uuid4())[:8].upper()
+            sid = str(row.get("sample_id", audit_id))
+
+            prompt_score = float(row.get("malicious_probability", 0.5))
+            vision_score = float(row.get("vision_score", 0.0))
+            risk_score = float(row.get("risk_score", max(prompt_score, vision_score)))
+            risk_level = str(row.get("risk_level", "MEDIUM"))
+            severity = str(row.get("severity", "medium")) if pd.notna(row.get("severity")) else "medium"
+            attack_family = str(row.get("attack_family", "unknown")) if pd.notna(row.get("attack_family")) else "unknown"
+
+            # Governance evaluation
+            gov = governance_agent.evaluate(
+                risk_score=risk_score,
+                vision_score=vision_score,
+                hidden_text_detected=float(row.get("hidden_text_score", 0.0)) >= 0.5,
+                keyword_density=float(row.get("keyword_density", 0.0)),
+                footer_density=float(row.get("footer_text_density", 0.0)),
+                watermark_score=float(row.get("watermark_score", 0.0)),
+                prompt_score=prompt_score,
+                attack_family_predicted=attack_family,
+                severity=severity,
+            )
+
+            total_ms = (time.perf_counter() - t0) * 1000
+
+            results.append(FinalDecision(
+                audit_log_id=audit_id,
+                sample_id=sid,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                decision=gov.decision,
+                risk_score=risk_score,
+                risk_level=risk_level,
+                prompt_score=prompt_score,
+                vision_score=vision_score,
+                confidence=max(prompt_score, 1 - prompt_score),
+                governance_rule_triggered=gov.rule_id,
+                reason=gov.reason,
+                sanitization_action=gov.sanitization_action,
+                policy_ref=gov.policy_ref,
+                attack_family_predicted=attack_family,
+                vision_ms=0.0,
+                prompt_ms=0.0,
+                risk_ms=0.0,
+                governance_ms=total_ms,
+                total_ms=total_ms,
+                vision_error=None,
+                prompt_error=None,
+                agent_version=AGENT_VERSION,
+            ))
+
+        return results

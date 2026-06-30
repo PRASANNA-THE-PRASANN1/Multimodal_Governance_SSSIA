@@ -179,15 +179,61 @@ class RiskAgent:
 
     # ── Feature importance (for paper) ────────────────────────────────────────
 
+    def _get_inner_lr(self):
+        """
+        Extract the base LogisticRegression from a potentially wrapped
+        CalibratedClassifierCV.  Falls back to the model itself if it
+        exposes .coef_ directly.
+        """
+        self._load()
+        # Direct LR — has .coef_
+        if hasattr(self._lr, "coef_"):
+            return self._lr
+        # CalibratedClassifierCV wrapper — drill into first calibrated estimator
+        if hasattr(self._lr, "calibrated_classifiers_"):
+            inner = self._lr.calibrated_classifiers_[0].estimator
+            if hasattr(inner, "coef_"):
+                return inner
+        raise AttributeError(
+            "Cannot extract coefficients — model type is not "
+            "LogisticRegression or CalibratedClassifierCV."
+        )
+
     def feature_importance(self) -> Dict[str, float]:
         """
         Returns feature → coefficient magnitude dict (sorted descending).
         Use this to populate Table 3 in the paper.
+
+        Handles both raw LogisticRegression and CalibratedClassifierCV
+        wrappers (the latter is used when Platt scaling is applied).
         """
-        self._load()
-        coefs = self._lr.coef_[0]
+        inner = self._get_inner_lr()
+        coefs = inner.coef_[0]
         importance = {col: float(abs(c)) for col, c in zip(self._columns, coefs)}
         return dict(sorted(importance.items(), key=lambda x: x[1], reverse=True))
+
+    def get_feature_columns(self) -> List[str]:
+        """Return the persisted feature column order."""
+        self._load()
+        return list(self._columns)
+
+    def calibration_info(self) -> Dict:
+        """
+        Returns calibration metadata for the paper's calibration curve.
+        Includes: number of calibrated sub-models, calibration method,
+        and the intercept/coefficients of the base estimator.
+        """
+        self._load()
+        info: Dict = {"model_type": type(self._lr).__name__}
+        if hasattr(self._lr, "calibrated_classifiers_"):
+            info["n_calibrated"] = len(self._lr.calibrated_classifiers_)
+            info["method"] = getattr(self._lr, "method", "sigmoid")
+        inner = self._get_inner_lr()
+        info["intercept"] = float(inner.intercept_[0])
+        info["coefficients"] = {
+            col: float(c) for col, c in zip(self._columns, inner.coef_[0])
+        }
+        return info
 
     # ── Build feature dict (helper for DecisionAgent) ─────────────────────────
 

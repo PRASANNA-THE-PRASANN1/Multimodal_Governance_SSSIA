@@ -96,6 +96,8 @@ class PromptAgent:
                 f"Model not found at: {self.model_dir}\n"
                 "Run Notebook 02 to train and save the model first."
             )
+        if (self.model_dir / "best_strategyA").exists() and (self.model_dir / "best_strategyA" / "config.json").exists():
+            self.model_dir = self.model_dir / "best_strategyA"
         print(f"[PromptAgent] Loading model from: {self.model_dir}")
         self._tokenizer = AutoTokenizer.from_pretrained(str(self.model_dir))
         self._model = AutoModelForSequenceClassification.from_pretrained(
